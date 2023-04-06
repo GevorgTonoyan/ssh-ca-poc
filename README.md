@@ -160,6 +160,87 @@ $ vault write -field=signed_key ssh-host-signer/sign/hostrole \
 $ chmod 0640 /etc/ssh/ssh_host_rsa_key-cert.pub
 #Restart the SSH service to pick up the changes.
 ```
+# **Groups & Policies**
+### github as an example
+
+#### add roles for specific groups
+```bash
+vault write ssh-client-signer/roles/frontend -<<"EOH"
+{
+  "algorithm_signer": "rsa-sha2-256",
+  "allow_user_certificates": true,
+  "allowed_users": "frontend",
+  "allowed_extensions": "permit-pty,permit-port-forwarding",
+  "default_extensions": {
+    "permit-pty": ""
+  },
+  "key_type": "ca",
+  "default_user": "frontend",
+  "ttl": "30m0s"
+}
+EOH
+```
+```bash
+vault write ssh-client-signer/roles/devops -<<"EOH"
+{
+  "algorithm_signer": "rsa-sha2-256",
+  "allow_user_certificates": true,
+  "allowed_users": "devops",
+  "allowed_extensions": "permit-pty,permit-port-forwarding",
+  "default_extensions": {
+    "permit-pty": ""
+  },
+  "key_type": "ca",
+  "default_user": "devops",
+  "ttl": "30m0s"
+}
+EOH
+```
+
+#### create policies and respective tokens
+```bash
+vim secret-frontend-policy.hcl
+path "ssh-client-signer/sign/frontend" {  capabilities = ["read", "create", "update"] }
+
+vim secret-devops-policy.hcl
+path "ssh-client-signer/sign/devops" {  capabilities = ["read", "create", "update"] }
+```
+
+#### command to write policy
+```bash
+vault policy write secret-frontend-policy secret-frontend-policy.hcl
+vault policy write secret-devops-policy secret-devops-policy.hcl
+```
+
+#### Enable Github auth method
+```bash
+vault auth enable github
+```
+
+#### Set a Github Organization in the configuration
+```bash
+vault write auth/github/config organization=${your github organization}
+```
+
+Now all users within the hashicorp GitHub organization are able to authenticate
+
+#### Teams Creation
+```bash
+vault write auth/github/map/teams/frontend value=default,secret-frontend-policy
+vault write auth/github/map/teams/devops value=default,secret-devops-policy
+```
+Where default & applications are the policies
+
+#### Display all authentication method
+```bash
+vault auth list
+```
+
+#### Before login with Gitub auth method, make sure "VAULT_TOKEN" environment variable is unset. 
+```bash
+unset VAULT_TOKEN
+vault login -method=github
+```
 
 ### **Client-Side Host Verification**
 
@@ -168,9 +249,82 @@ $ chmod 0640 /etc/ssh/ssh_host_rsa_key-cert.pub
 $ vault read -field=public_key ssh-host-signer/config/ca
 
 #Add the resulting public key to the known_hosts file with authority.
-# ~/.ssh/known_hosts
-@cert-authority *.example.com ssh-rsa AAAAB3NzaC1yc2EAAA...
+# /etc/ssh/ssh_known_hosts
+@cert-authority * ssh-rsa AAAAB3NzaC1yc2EAAA...
+```
 
+### **Start audit vault**
+```bash
+vault audit enable file file_path=/var/log/vault_audit.log
+```
+**Vault metrics to GCP**
+[Prerequisites](https://cloud.google.com/stackdriver/docs/solutions/agents/ops-agent/third-party/vault?_ga=2.152791481.-1887701175.1678728226#prerequisites)
+```bash
+#To collect Vault telemetry, you must install the Ops Agent on Vault Instance:
+curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+sudo bash add-google-cloud-ops-agent-repo.sh --also-install
+```
+```bash
+#To collect telemetry from your Vault instance, you must set the prometheus_retention_time field to a non-zero value in your HCL or JSON Vault configuration file.
+#Full configuration options can be found at https://www.vaultproject.io/docs/configuration
+telemetry {
+  prometheus_retention_time = "10m"
+  disable_hostname = false
+}
+```
+```bash
+#Create Prometheus ACL policy to access metrics endpoint.
+vault policy write prometheus-metrics - << EOF
+path "/sys/metrics" {
+  capabilities = ["read"]
+}
+EOF
+```
+```bash
+#Create an example token with the prometheus-metrics policy to access Vault metrics.
+#This token is used as `$VAULT_TOKEN` in your Ops Agent configuration for Vault.
+vault token create -field=token -policy prometheus-metrics > prometheus-token
+```
+#### **Example configuration**
+##### The following command creates the configuration to collect and ingest telemetry for Vault and restarts the Ops Agent.
+```bash
+# Configures Ops Agent to collect telemetry from the app and restart Ops Agent.
+
+set -e
+
+# Create a back up of the existing file so existing configurations are not lost.
+sudo cp /etc/google-cloud-ops-agent/config.yaml /etc/google-cloud-ops-agent/config.yaml.bak
+
+# Create a Vault token that has read capabilities to /sys/metrics policy.
+# For more information see: https://developer.hashicorp.com/vault/tutorials/monitoring/monitor-telemetry-grafana-prometheus?in=vault%2Fmonitoring#define-prometheus-acl-policy
+VAULT_TOKEN=$(cat prometheus-token)
+
+
+sudo tee /etc/google-cloud-ops-agent/config.yaml > /dev/null << EOF
+metrics:
+  receivers:
+    vault:
+      type: vault
+      token: $VAULT_TOKEN
+      endpoint: 127.0.0.1:8200
+  service:
+    pipelines:
+      vault:
+        receivers:
+          - vault
+logging:
+  receivers:
+    vault_audit:
+      type: vault_audit
+      include_paths: [/var/log/vault_audit.log]
+  service:
+    pipelines:
+      vault:
+        receivers:
+          - vault_audit
+EOF
+
+sudo service google-cloud-ops-agent restart
 ```
 
 # What will be different in production deployment
@@ -185,4 +339,4 @@ There are few things that will need to be fine tuned for this to be production r
   - manual setup with copy pasting or installing and using vault on the target hosts
   - configuration management like ansible to copy the keys and add the required changes into the `sshd_config` on the relevant machines
   - using a custom golden image for our VM’s (or creating those) that will already have the mentioned configuration and key present
-- For host key signing the prerequisite is to have the host public key that then needs to be singed by vault - this again can be done using automation or whenever a new VM is spawned we can take it’s public key and sign it - there is then the step of populating clients `~/.ssh/known_hosts` file with that public key
+- For host key signing the prerequisite is to have the host public key that then needs to be singed by vault - this again can be done using automation or whenever a new VM is spawned we can take it’s public key and sign it - there is then the step of populating clients `/etc/ssh/ssh_known_hosts` file with that public key
